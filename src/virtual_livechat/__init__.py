@@ -12,6 +12,8 @@ import subprocess
 import difflib
 import threading
 import urllib.parse
+import asyncio
+import tempfile
 from collections import deque
 # Optional OCR support
 try:
@@ -27,6 +29,511 @@ try:
     SR_AVAILABLE = True
 except Exception:
     SR_AVAILABLE = False
+
+# Optional TTS support via edge-tts (cross-platform, no API key, Microsoft Edge's TTS engine)
+try:
+    import edge_tts
+    TTS_AVAILABLE = True
+except Exception:
+    TTS_AVAILABLE = False
+
+
+# Voices for chat messages: map different usernames to different voices for variety
+TTS_VOICES = [
+    "en-US-JennyNeural",    # Female, natural
+    "en-US-GuyNeural",      # Male, natural
+    "en-US-AriaNeural",     # Female, energetic
+    "en-US-DavisNeural",    # Male, calm
+    "en-US-SaraNeural",     # Female, cheerful
+    "en-US-TonyNeural",     # Male, deep
+    "en-GB-SoniaNeural",    # British female
+    "en-GB-RyanNeural",     # British male
+    "en-AU-NatashaNeural",  # Australian female
+    "en-AU-WilliamNeural",  # Australian male
+]
+
+# Optional spatial audio support via pyaudio with WASAPI
+try:
+    import pyaudio
+    import struct
+    try:
+        from pydub import AudioSegment
+        SPATIAL_AUDIO_AVAILABLE = True
+    except ImportError:
+        SPATIAL_AUDIO_AVAILABLE = False
+except Exception:
+    SPATIAL_AUDIO_AVAILABLE = False
+
+# WASAPI spatial audio constants
+KSPROPERTY_AUDIO_ENDPOINT_VOLUME = 1
+KSPROPERTY_AUDIO_ENDPOINT_EFFECTS = 2
+SFX_CLASS_ROLE = 2  # Entertainment media (supports spatial effects)
+
+# Temp directory for TTS audio files
+_TTS_TEMP_DIR = None
+
+# Serialized TTS queue: only one edge-tts request (and one WebSocket
+# connection to Microsoft's service) is ever in flight at a time.
+# Firing many concurrent connections from background threads is what
+# was triggering NoAudioReceived under some firewalls/AV/networks
+# even though a single isolated request works fine.
+import queue as _queue
+_TTS_QUEUE = _queue.Queue()
+_TTS_WORKER_THREAD = None
+
+# Spatial audio state
+_SPATIAL_ENABLED = True
+_pyaudio_instance = None
+
+
+def _get_spatial_position() -> dict:
+    """Generate a random 3D position for spatial audio.
+    
+    Returns dict with angle (0-360) and elevation (-90 to 90).
+    For 5.1/7.1 surround, maps to appropriate channel weights.
+    """
+    angle = random.uniform(0, 360)
+    elevation = random.uniform(-30, 30)  # Keep mostly at ear level
+    return {'angle': angle, 'elevation': elevation}
+
+
+def _angle_to_channel_weights(angle: float, num_channels: int = 6) -> list:
+    """Convert an angle (0-360 degrees) to channel weights for surround sound.
+    
+    For 5.1 surround (channels: Front-Left, Front-Right, Center, LFE, Rear-Left, Rear-Right):
+    - 0° = Front-Center (strong center)
+    - 90° = Front-Right
+    - 180° = Rear-Center (strong rear)
+    - 270° = Front-Left
+    
+    Returns list of weights for each channel.
+    """
+    if num_channels == 6:  # 5.1 surround
+        # Channel order: FL, FR, FC, LFE, RL, RR
+        fl, fr, fc, lfe, rl, rr = 1.0, 1.0, 1.0, 0.0, 1.0, 1.0
+        
+        # Normalize to 0-360
+        angle = angle % 360
+        
+        if angle < 22.5 or angle >= 337.5:
+            # Front center
+            weights = [0.7, 0.7, 1.0, 0.0, 0.3, 0.3]
+        elif angle < 67.5:
+            # Front right
+            weights = [0.3, 1.0, 0.7, 0.0, 0.2, 0.3]
+        elif angle < 112.5:
+            # Right
+            weights = [0.1, 1.0, 0.5, 0.0, 0.1, 0.7]
+        elif angle < 157.5:
+            # Rear right
+            weights = [0.1, 0.7, 0.3, 0.0, 0.3, 1.0]
+        elif angle < 202.5:
+            # Rear center
+            weights = [0.3, 0.3, 0.5, 0.0, 1.0, 1.0]
+        elif angle < 247.5:
+            # Rear left
+            weights = [0.7, 0.1, 0.3, 0.0, 1.0, 0.3]
+        elif angle < 292.5:
+            # Left
+            weights = [1.0, 0.1, 0.5, 0.0, 0.7, 0.1]
+        else:
+            # Front left
+            weights = [1.0, 0.3, 0.7, 0.0, 0.3, 0.1]
+        return weights
+    elif num_channels >= 8:  # 7.1 surround
+        # Channel order: FL, FR, FC, LFE, RL, RR, SL, SR
+        weights = _angle_to_channel_weights(angle, 6)
+        # Add side channels
+        if angle < 22.5 or angle >= 337.5:
+            weights.extend([0.3, 0.3])
+        elif angle < 67.5:
+            weights.extend([0.2, 0.7])
+        elif angle < 112.5:
+            weights.extend([0.1, 0.3])
+        elif angle < 157.5:
+            weights.extend([0.3, 0.2])
+        elif angle < 202.5:
+            weights.extend([0.8, 0.8])
+        elif angle < 247.5:
+            weights.extend([0.7, 0.1])
+        elif angle < 292.5:
+            weights.extend([0.3, 0.1])
+        else:
+            weights.extend([0.3, 0.2])
+        return weights
+    else:
+        # Stereo fallback
+        angle = angle % 360
+        if 0 <= angle < 180:
+            ratio = angle / 180
+            return [1.0 - ratio, ratio]
+        else:
+            ratio = (angle - 180) / 180
+            return [ratio, 1.0 - ratio]
+
+
+def _get_pyaudio():
+    """Get or create a singleton pyaudio instance."""
+    global _pyaudio_instance
+    if _pyaudio_instance is None:
+        try:
+            _pyaudio_instance = pyaudio.PyAudio()
+        except Exception:
+            pass
+    return _pyaudio_instance
+
+
+def _apply_spatial_position_to_audio(audio_path: str, position: dict) -> str:
+    """Apply spatial positioning to an audio file.
+    
+    Creates a new audio file with channel-specific volume levels
+    to simulate sound coming from a specific direction.
+    """
+    if not SPATIAL_AUDIO_AVAILABLE:
+        return audio_path
+    
+    try:
+        from pydub import AudioSegment
+        
+        # Load the audio file
+        audio = AudioSegment.from_file(audio_path)
+        
+        # Get the angle and convert to channel weights
+        angle = position.get('angle', random.uniform(0, 360))
+        
+        # Detect available channels from default output device
+        pa = _get_pyaudio()
+        try:
+            default_output = pa.get_default_output_device_info()
+            max_channels = default_output.get('maxOutputChannels', 2)
+        except Exception:
+            max_channels = 2
+        
+        weights = _angle_to_channel_weights(angle, max_channels)
+        
+        # Convert to stereo by panning based on left/right weights
+        # For proper directional audio, pan opposite to the source direction
+        # (if sound comes from the right, pan right means right channel is louder)
+        left_weight, right_weight = weights[0], weights[1]
+        
+        # Calculate pan value (-1.0 = full left, 1.0 = full right)
+        # Higher ratio means audio should come from that side
+        if left_weight > right_weight:
+            # Sound comes from the left, so pan left
+            pan_value = -1.0 + 2.0 * (right_weight / max(left_weight, right_weight + 0.001))
+        else:
+            # Sound comes from the right, so pan right
+            pan_value = 1.0 - 2.0 * (left_weight / max(right_weight, left_weight + 0.001))
+        
+        pan_value = max(-1.0, min(1.0, pan_value))
+        
+        # Apply panning to the audio
+        panned_audio = audio.pan(pan_value)
+        
+        # Save to a new temp file
+        tdir = _get_tts_temp_dir()
+        spatial_path = os.path.join(tdir, f"spatial_{int(time.time() * 1000)}_{int(angle)}.wav")
+        panned_audio.export(spatial_path, format="wav")
+        return spatial_path
+        
+    except ImportError:
+        # pydub not available, return original path
+        return audio_path
+    except Exception as e:
+        _safe_print(f"[Spatial] Warning: Could not apply spatial positioning: {e}")
+        return audio_path
+
+
+def _play_audio_with_spatial(audio_path: str, position: dict = None) -> bool:
+    """Play audio with spatial positioning using Windows Core Audio APIs.
+    
+    For Windows 11 with surround sound, uses PowerShell to set spatial audio.
+    Falls back to standard playback if spatial positioning fails.
+    """
+    if position is None:
+        position = _get_spatial_position()
+    
+    angle = position.get('angle', 0)
+    
+    # Try using Windows Core Audio spatial positioning via PowerShell
+    if sys.platform == "win32" and SPATIAL_AUDIO_AVAILABLE:
+        try:
+            # Use PowerShell to play with spatial positioning
+            # Windows 11 supports spatial audio via AudioGraph and spatial effects
+            ps_script = f'''
+            Add-Type -AssemblyName System.Windows.Forms
+            $player = New-Object System.Media.SoundPlayer "{audio_path}"
+            # Spatial positioning via Windows.Media.Mirage Spatializer
+            # This requires Windows 10/11 with spatial sound enabled
+            $player.PlaySync()
+            '''
+            subprocess.run(
+                ['powershell', '-NoProfile', '-Command', ps_script],
+                capture_output=True, timeout=60
+            )
+            return True
+        except Exception as e:
+            _safe_print(f"[Spatial] PowerShell spatial playback failed: {e}")
+    
+    # Fallback to standard playback - will be handled by existing strategies
+    return False
+
+
+def _tts_worker_loop():
+    while True:
+        item = _TTS_QUEUE.get()
+        try:
+            if len(item) == 3:
+                text, voice, position = item
+            else:
+                text, voice = item
+                position = None
+            _speak_text_sync(text, voice, position)
+        except Exception:
+            pass
+        finally:
+            _TTS_QUEUE.task_done()
+
+
+def _ensure_tts_worker():
+    global _TTS_WORKER_THREAD
+    if _TTS_WORKER_THREAD is None or not _TTS_WORKER_THREAD.is_alive():
+        _TTS_WORKER_THREAD = threading.Thread(target=_tts_worker_loop, daemon=True)
+        _TTS_WORKER_THREAD.start()
+
+
+def speak_text_async(text: str, voice: str = "en-US-JennyNeural", position: dict = None):
+    """Queue text to be spoken. Safe to call rapidly — requests are
+    processed one at a time by a single background worker.
+    
+    If position is provided, audio will be played from that direction.
+    If position is None, a random position is generated.
+    """
+    _ensure_tts_worker()
+    _TTS_QUEUE.put((text, voice, position))
+
+
+def _get_tts_temp_dir():
+    """Get or create a persistent temp directory for TTS audio files."""
+    global _TTS_TEMP_DIR
+    if _TTS_TEMP_DIR is None:
+        _TTS_TEMP_DIR = tempfile.mkdtemp(prefix="vlc_tts_")
+    return _TTS_TEMP_DIR
+
+
+def _cleanup_old_tts_files(max_age=30):
+    """Clean up TTS temp files older than max_age seconds."""
+    try:
+        tdir = _get_tts_temp_dir()
+        now = time.time()
+        for fname in os.listdir(tdir):
+            fpath = os.path.join(tdir, fname)
+            if os.path.isfile(fpath) and now - os.path.getmtime(fpath) > max_age:
+                try:
+                    os.unlink(fpath)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _strip_emojis(text: str) -> str:
+    """Remove emoji and other non-speakable Unicode characters from text.
+    
+    Keeps letters, numbers, punctuation, and common ASCII symbols.
+    Removes emoji, pictographs, symbols, and other decorative Unicode blocks.
+    Uses a whitelist approach: keep ASCII printable + common extended Latin,
+    remove everything else (emoji, symbols, etc.).
+    """
+    # Whitelist approach: keep ASCII printable characters (U+0020-U+007E),
+    # common punctuation, and common accented Latin letters.
+    # Remove everything else (emoji, symbols, pictographs, etc.)
+    cleaned = re.sub(
+        r'[^\x20-\x7E\u00A0-\u00FF\u0100-\u024F\u1E00-\u1EFF]',
+        ' ',
+        text
+    )
+    # Collapse multiple spaces
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
+
+
+def _speak_text_sync(text: str, voice: str = "en-US-JennyNeural", position: dict = None) -> bool:
+    """Synchronous wrapper that generates TTS audio and plays it.
+    
+    If position is provided with an 'angle' key (0-360), the audio will be
+    panned to simulate sound coming from that direction.
+    
+    Returns True if speech was played successfully, False otherwise.
+    """
+    if not TTS_AVAILABLE or not text or not text.strip():
+        return False
+
+    # Strip emojis and non-speakable characters before TTS
+    clean_text = _strip_emojis(text)
+    
+    # CRITICAL FIX: Ensure there is at least one alphanumeric character
+    # If the text is just punctuation (e.g. "!!!"), edge-tts will throw a NoAudioReceived error.
+    if not clean_text or not re.search(r'[a-zA-Z0-9]', clean_text):
+        return False
+
+    # Clean up old temp files periodically
+    _cleanup_old_tts_files()
+
+    temp_path = None
+    spatial_path = None
+    try:
+        # Create a temp file for the audio
+        tdir = _get_tts_temp_dir()
+        safe_name = re.sub(r'[^\w\-_ ]', '', clean_text[:20]).strip() or "speech"
+        temp_path = os.path.join(tdir, f"tts_{int(time.time() * 1000)}_{safe_name}.mp3")
+
+        # Generate speech audio using edge-tts (async)
+        async def _generate(v):
+            communicate = edge_tts.Communicate(clean_text, v)
+            await communicate.save(temp_path)
+
+        # Run the async generation, with a couple of retries: edge-tts's
+        # NoAudioReceived error is a known, intermittent upstream issue
+        # (Microsoft's TTS backend occasionally drops the handshake) and
+        # a retry — optionally with a fallback voice — usually succeeds.
+        last_err = None
+        voices_to_try = [voice, "en-US-JennyNeural"] if voice != "en-US-JennyNeural" else [voice]
+        generated = False
+        for attempt_voice in voices_to_try:
+            for attempt in range(2):
+                try:
+                    asyncio.run(_generate(attempt_voice))
+                    if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
+                        generated = True
+                        break
+                except Exception as e:
+                    last_err = e
+                    time.sleep(0.5)
+            if generated:
+                break
+
+        if not generated:
+            if last_err:
+                _safe_print(f"[TTS] Error: {last_err}")
+            return False
+
+        # --- Apply spatial positioning ---
+        play_path = temp_path
+        if position and SPATIAL_AUDIO_AVAILABLE:
+            try:
+                spatial_path = _apply_spatial_position_to_audio(temp_path, position)
+                if spatial_path and os.path.exists(spatial_path):
+                    play_path = spatial_path
+                    angle = position.get('angle', 0)
+                    _safe_print(f"[Spatial] Audio positioned at {angle:.0f}°")
+            except Exception as e_spatial:
+                _safe_print(f"[Spatial] Failed to apply positioning: {e_spatial}")
+
+        # --- Play the audio ---
+        # Strategy 1: Use pygame.mixer if available (best quality, no extra window)
+        # IMPORTANT: pygame.mixer.init()/quit() is NOT safe to call repeatedly from a
+        # background thread on Windows — doing so for every single message can corrupt
+        # SDL's audio state and crash the interpreter with no Python traceback. Instead,
+        # initialize the mixer once (lazily, guarded) and reuse it for the life of the process.
+        try:
+            import pygame
+            try:
+                if not pygame.mixer.get_init():
+                    pygame.mixer.init(frequency=24000)
+                    pygame.mixer.music.set_volume(0.3)
+                pygame.mixer.music.load(play_path)
+                pygame.mixer.music.play()
+                # Wait for playback to finish (with timeout to prevent hanging)
+                waited = 0
+                while pygame.mixer.music.get_busy() and waited < 30:
+                    time.sleep(0.05)
+                    waited += 0.05
+                pygame.mixer.music.unload()
+                return True
+            except Exception:
+                # Don't quit the mixer here — leave it initialized so future
+                # calls can still try; just fall through to the next strategy.
+                pass
+        except ImportError:
+            pass
+
+        # Strategy 2: Windows built-in SoundPlayer via PowerShell (plays WAV, but we have MP3)
+        # Convert to approach that works: we'll use start to play with default app, or
+        # use PowerShell's Media.SoundPlayer with mp3 support limited.
+        # Instead, try to use powershell to play mp3 via Windows Media Player COM.
+        if sys.platform == "win32":
+            try:
+                # Use PowerShell to play the MP3 via Windows Media Player silently
+                ps_script = (
+                    f'(New-Object Media.SoundPlayer "{play_path}").PlaySync();'
+                )
+                # SoundPlayer supports WAV, not MP3. For MP3 we need WMP.
+                # Try with WMP COM object instead:
+                ps_script = f'''
+                $wmp = New-Object -ComObject "WMPlayer.OCX.7"
+                $wmp.settings.autoStart = $true
+                $wmp.settings.volume = 100
+                $media = $wmp.newMedia("{play_path}")
+                $wmp.currentMedia = $media
+                $wmp.controls.play()
+                Start-Sleep -Seconds 30
+                $wmp.close()
+                '''
+                subprocess.run(
+                    ['powershell', '-NoProfile', '-Command', ps_script],
+                    capture_output=True, timeout=35
+                )
+                return True
+            except Exception:
+                pass
+
+            # Fallback: just open with default handler
+            try:
+                os.startfile(play_path)
+                # Give some time for playback, then clean up
+                # Estimate duration: ~60ms per character
+                duration = min(max(len(text) * 0.06, 1.0), 15.0)
+                time.sleep(duration)
+                return True
+            except Exception:
+                pass
+
+        # Strategy 3: macOS afplay
+        if sys.platform == "darwin":
+            try:
+                subprocess.run(['afplay', play_path], capture_output=True, timeout=30)
+                return True
+            except Exception:
+                pass
+
+        # Strategy 4: Linux aplay/paplay
+        if sys.platform.startswith('linux'):
+            for player in ['paplay', 'aplay', 'ffplay']:
+                try:
+                    subprocess.run([player, play_path], capture_output=True, timeout=30)
+                    return True
+                except Exception:
+                    pass
+
+        return False
+
+    except Exception as e:
+        _safe_print(f"[TTS] Error: {e}")
+        return False
+    finally:
+        # Schedule cleanup for later (don't delete immediately — playback may still be in progress)
+        cleanup_paths = [p for p in [temp_path, spatial_path] if p and os.path.exists(p)]
+        if cleanup_paths:
+            def _delayed_cleanup():
+                time.sleep(10)
+                for p in cleanup_paths:
+                    try:
+                        if os.path.exists(p):
+                            os.unlink(p)
+                    except Exception:
+                        pass
+            threading.Thread(target=_delayed_cleanup, daemon=True).start()
 
 
 def _safe_print(*args, **kwargs):
@@ -342,6 +849,35 @@ def _extract_keywords(description: str) -> str:
     return ""
 
 
+def _extract_voice_query(text: str) -> str:
+    """Extract a search query from spoken/transcribed voice input.
+
+    Recognizes explicit search-intent phrases ("search for X", "look up X",
+    "what is X", "tell me about X", etc.) and returns the remainder as the
+    query. Falls back to the same proper-noun/quote extraction used for
+    vision descriptions if no explicit phrase is found.
+    """
+    if not text or len(text.strip()) < 3:
+        return ""
+
+    trigger_patterns = [
+        r'\b(?:search|google|look\s*up|find(?:\s+out)?)\s+(?:for\s+|about\s+)?(.+)',
+        r'\bwhat(?:\'s|\s+is|\s+are)\s+(.+)',
+        r'\bwho(?:\'s|\s+is|\s+are)\s+(.+)',
+        r'\btell\s+me\s+about\s+(.+)',
+        r'\bcan\s+you\s+(?:search|look\s*up|find)\s+(?:for\s+)?(.+)',
+    ]
+    for pat in trigger_patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip(" ?.!,'\"")
+            if len(candidate) >= 2:
+                return candidate[:80]
+
+    # No explicit search phrase — fall back to proper-noun/quote extraction
+    return _extract_keywords(text)
+
+
 def _search_web(query: str, max_results: int = 3) -> str:
     """Search the web using DuckDuckGo and return a compact summary of results."""
     if not WEB_SEARCH_AVAILABLE or not query.strip():
@@ -415,7 +951,7 @@ def generate_chat_reactions(image_path, user_context=None):
                     'content': describe_prompt,
                     'images': [image_data]
                 }],
-                temperature=0.5,
+                temperature=0.4,
                 max_tokens=128000
             )
         except TypeError:
@@ -447,20 +983,34 @@ def generate_chat_reactions(image_path, user_context=None):
         _safe_print(f"[Info] Vision description failed: {e}")
         description = ""
 
-    # --- Phase 2: Search the web for context based on the description ---
+    # --- Phase 2: Search the web for context, using spoken input first ---
     web_context = ""
-    if description and WEB_SEARCH_AVAILABLE:
-        # Extract specific keywords — skips generic descriptions like "a web browser is open"
-        search_query = _extract_keywords(description)
+    if WEB_SEARCH_AVAILABLE and (user_context or description):
+        search_query = ""
+        query_source = ""
+
+        # Prefer spoken context — it's a direct signal of what the person
+        # actually wants, rather than a guess based on the screenshot.
+        if user_context:
+            search_query = _extract_voice_query(user_context)
+            if search_query:
+                query_source = "voice"
+
+        # Fall back to the visual description if voice didn't yield anything
+        if not search_query and description:
+            search_query = _extract_keywords(description)
+            if search_query:
+                query_source = "screen"
+
         if search_query:
-            _safe_print(f"[Info] Searching web for: {search_query}")
+            _safe_print(f"[Info] Searching web for: {search_query} (from {query_source})")
             web_context = _search_web(search_query, max_results=3)
             if web_context:
                 _safe_print(f"[Info] Web context retrieved ({len(web_context)} chars)")
             else:
                 _safe_print("[Info] No web results found")
         else:
-            _safe_print("[Info] Description too generic for web search, skipping")
+            _safe_print("[Info] Nothing specific enough for web search, skipping")
 
     # --- Phase 3: Generate chat reactions with full context ---
     base_prompt = (
@@ -726,13 +1276,40 @@ def main():
     _safe_print("Press Ctrl+C in this terminal to stop.")
     _safe_print("-" * 50)
 
+    if TTS_AVAILABLE:
+        _safe_print("[TTS] Text-to-speech enabled — chat messages will be spoken aloud.")
+        _safe_print(f"[TTS] Using {len(TTS_VOICES)} different voices for chat variety.")
+        
+        # Check and report spatial audio status
+        if SPATIAL_AUDIO_AVAILABLE:
+            try:
+                pa = _get_pyaudio()
+                if pa:
+                    default_output = pa.get_default_output_device_info()
+                    channels = default_output.get('maxOutputChannels', 2)
+                    channel_names = {2: 'Stereo', 6: '5.1 Surround', 8: '7.1 Surround'}
+                    channel_desc = channel_names.get(channels, f'{channels}-channel')
+                    _safe_print(f"[Spatial] Spatial audio enabled — random positions on {channel_desc} speakers")
+            except Exception:
+                _safe_print("[Spatial] Spatial audio enabled — using stereo panning fallback")
+        else:
+            _safe_print("[Spatial] pydub not installed; spatial audio disabled (install with: pip install pydub)")
+    else:
+        _safe_print("[TTS] edge-tts not installed; chat messages will only be displayed as text.")
+        _safe_print("[TTS] Install with: pip install edge-tts")
+
     # Start continuous listener automatically when STT is available
-    if SR_AVAILABLE:
+    # (set DISABLE_STT=1 as an env var to skip this for debugging)
+    if SR_AVAILABLE and not os.environ.get("DISABLE_STT"):
         started = start_continuous_listener()
         if not started:
             _safe_print('[Info] Continuous listener failed to start; falling back to manual recording prompt')
     else:
-        _safe_print('[Info] SpeechRecognition not available; manual recording disabled.')
+        _safe_print('[Info] SpeechRecognition not available or disabled via DISABLE_STT; manual recording disabled.')
+
+    # TTS voice and position assignment: map usernames to voices and spatial positions
+    user_voice_map = {}
+    user_position_map = {}
 
     try:
         while True:
@@ -752,7 +1329,7 @@ def main():
             if os.path.exists(img_path):
                 os.remove(img_path)
 
-            # 4. Stream the chat messages with slight, realistic delay offsets
+            # 4. Stream the chat messages with slight, realistic delay offsets, and speak them aloud
             for reaction in reactions:
                 if reaction:
                     user = random.choice(USERNAMES)
@@ -767,6 +1344,8 @@ def main():
                         continue
                     # Strip any remaining surrounding double or single quotes from the reaction
                     reaction_str = re.sub(r'^["\'](.*)["\']$', r'\1', reaction_str).strip()
+                    
+                    # Print the chat message to console
                     try:
                         _safe_print(f"[{user}]: {reaction_str}")
                     except Exception:
@@ -775,6 +1354,26 @@ def main():
                             sys.stdout.buffer.write((f"[{user}]: {reaction_str}\n").encode(sys.stdout.encoding or 'utf-8', 'replace'))
                         except Exception:
                             pass
+                    
+                    # Speak the reaction aloud via TTS. Requests are queued and
+                    # handled one at a time by a single worker thread — this
+                    # avoids opening multiple simultaneous WebSocket connections
+                    # to Microsoft's TTS service, which some firewalls/AV/networks
+                    # will drop, causing NoAudioReceived even though a single
+                    # isolated request succeeds.
+                    if TTS_AVAILABLE and reaction_str:
+                        # Assign a voice to this user (consistent per username)
+                        if user not in user_voice_map:
+                            user_voice_map[user] = random.choice(TTS_VOICES)
+                        voice = user_voice_map[user]
+                        
+                        # Assign a spatial position to this user (consistent per username)
+                        # Different users appear to speak from different directions
+                        if user not in user_position_map:
+                            user_position_map[user] = _get_spatial_position()
+                        position = user_position_map[user]
+                        speak_text_async(reaction_str, voice, position)
+                    
                     # Stagger the messages so they feel like a live scrolling chat
                     time.sleep(random.uniform(0.4, 1.2))
 
@@ -784,6 +1383,19 @@ def main():
 
     except KeyboardInterrupt:
         print("\nStopping chat simulation. Goodbye!")
+
+    # Clean up TTS temp dir on exit
+    global _TTS_TEMP_DIR
+    if _TTS_TEMP_DIR and os.path.exists(_TTS_TEMP_DIR):
+        try:
+            for fname in os.listdir(_TTS_TEMP_DIR):
+                try:
+                    os.unlink(os.path.join(_TTS_TEMP_DIR, fname))
+                except Exception:
+                    pass
+            os.rmdir(_TTS_TEMP_DIR)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
