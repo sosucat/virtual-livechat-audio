@@ -999,7 +999,7 @@ def generate_chat_reactions(image_path, user_context=None):
                     'content': describe_prompt,
                     'images': [image_data]
                 }],
-                temperature=0.4,
+                temperature=0.6,
                 max_tokens=128000
             )
         except TypeError:
