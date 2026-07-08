@@ -14,6 +14,12 @@ import threading
 import urllib.parse
 import asyncio
 import tempfile
+import warnings
+# Suppress pydub syntax warnings (invalid escape sequences in pydub source)
+warnings.filterwarnings("ignore", category=SyntaxWarning, module="pydub")
+# Verbose mode - set VERBOSE_SPATIAL=0 or VERBOSE_INFO=0 to suppress specific messages
+VERBOSE_SPATIAL = 0
+VERBOSE_INFO = 0
 from collections import deque
 # Optional OCR support
 try:
@@ -89,12 +95,13 @@ _pyaudio_instance = None
 def _get_spatial_position() -> dict:
     """Generate a random 3D position for spatial audio.
     
-    Returns dict with angle (0-360) and elevation (-90 to 90).
-    For 5.1/7.1 surround, maps to appropriate channel weights.
+    Returns dict with angle (0-360), elevation (-90 to 90), and distance (0-100).
+    The distance affects volume and audio filtering to simulate distance effects.
     """
     angle = random.uniform(0, 360)
     elevation = random.uniform(-30, 30)  # Keep mostly at ear level
-    return {'angle': angle, 'elevation': elevation}
+    distance = random.uniform(10, 100)  # Distance in arbitrary units (lower = closer)
+    return {'angle': angle, 'elevation': elevation, 'distance': distance}
 
 
 def _angle_to_channel_weights(angle: float, num_channels: int = 6) -> list:
@@ -186,8 +193,9 @@ def _get_pyaudio():
 def _apply_spatial_position_to_audio(audio_path: str, position: dict) -> str:
     """Apply spatial positioning to an audio file.
     
-    Creates a new audio file with channel-specific volume levels
-    to simulate sound coming from a specific direction.
+    Creates a new audio file with channel-specific volume levels, panning,
+    and distance-based effects (low-pass filter + volume reduction) to 
+    simulate sound coming from a specific direction at a specific distance.
     """
     if not SPATIAL_AUDIO_AVAILABLE:
         return audio_path
@@ -198,8 +206,9 @@ def _apply_spatial_position_to_audio(audio_path: str, position: dict) -> str:
         # Load the audio file
         audio = AudioSegment.from_file(audio_path)
         
-        # Get the angle and convert to channel weights
+        # Get position parameters
         angle = position.get('angle', random.uniform(0, 360))
+        distance = position.get('distance', 50)  # Distance in arbitrary units
         
         # Detect available channels from default output device
         pa = _get_pyaudio()
@@ -212,17 +221,12 @@ def _apply_spatial_position_to_audio(audio_path: str, position: dict) -> str:
         weights = _angle_to_channel_weights(angle, max_channels)
         
         # Convert to stereo by panning based on left/right weights
-        # For proper directional audio, pan opposite to the source direction
-        # (if sound comes from the right, pan right means right channel is louder)
         left_weight, right_weight = weights[0], weights[1]
         
         # Calculate pan value (-1.0 = full left, 1.0 = full right)
-        # Higher ratio means audio should come from that side
         if left_weight > right_weight:
-            # Sound comes from the left, so pan left
             pan_value = -1.0 + 2.0 * (right_weight / max(left_weight, right_weight + 0.001))
         else:
-            # Sound comes from the right, so pan right
             pan_value = 1.0 - 2.0 * (left_weight / max(right_weight, left_weight + 0.001))
         
         pan_value = max(-1.0, min(1.0, pan_value))
@@ -230,10 +234,42 @@ def _apply_spatial_position_to_audio(audio_path: str, position: dict) -> str:
         # Apply panning to the audio
         panned_audio = audio.pan(pan_value)
         
+        # Apply distance-based effects:
+        # - Volume reduction: closer (lower distance) = louder, farther (higher distance) = quieter
+        # - Low-pass filter: simulates "blurring" - distant sounds are muffled (less high frequencies)
+        # - High frequencies are severely attenuated to make distant speech less intelligible
+        # Distance range: 10-100 (normalized to 0-1), where 10 is close and 100 is far
+        distance_normalized = min(max(distance, 10), 100) / 100.0  # 0.1 to 1.0
+        
+        # Volume reduction: closer = louder, farther = much quieter
+        # Close (~10): ~1.0 (moderate), Far (~100): ~0.8 (very quiet, barely audible)
+        volume_multiplier = 1.0 - (0.2 * distance_normalized)
+        volume_db = 28 * (volume_multiplier - 1)  # Convert to dB change
+        
+        # Apply volume reduction
+        processed_audio = panned_audio.apply_gain(volume_db)
+        
+        # Apply very aggressive low-pass filter for distance effect
+        # Makes distant speech highly muffled and nearly incomprehensible
+        # Cutoff frequency range: 800 Hz (close) to 500 Hz (far)
+        # Human speech intelligibility relies heavily on frequencies 1000-4000 Hz
+        # At far distances, these get severely attenuated
+        cutoff_freq = int(800 - (300 * distance_normalized))
+        
+        # pydub's low_pass_filter requires the audio to have the right sample rate
+        # and uses scipy if available, otherwise does a basic implementation
+        try:
+            # Apply low-pass filter to simulate distance "blurring"
+            from pydub.playback import _play_with_simpleaudio
+            processed_audio = processed_audio.low_pass_filter(cutoff_freq)
+        except Exception:
+            # If low_pass_filter fails, just continue with volume-adjusted audio
+            pass
+        
         # Save to a new temp file
         tdir = _get_tts_temp_dir()
-        spatial_path = os.path.join(tdir, f"spatial_{int(time.time() * 1000)}_{int(angle)}.wav")
-        panned_audio.export(spatial_path, format="wav")
+        spatial_path = os.path.join(tdir, f"spatial_{int(time.time() * 1000)}_{int(angle)}_{int(distance)}.wav")
+        processed_audio.export(spatial_path, format="wav")
         return spatial_path
         
     except ImportError:
@@ -426,9 +462,9 @@ def _speak_text_sync(text: str, voice: str = "en-US-JennyNeural", position: dict
                 if spatial_path and os.path.exists(spatial_path):
                     play_path = spatial_path
                     angle = position.get('angle', 0)
-                    _safe_print(f"[Spatial] Audio positioned at {angle:.0f}°")
+                    _verbose_print('spatial', f"[Spatial] Audio positioned at {angle:.0f}°")
             except Exception as e_spatial:
-                _safe_print(f"[Spatial] Failed to apply positioning: {e_spatial}")
+                _verbose_print('spatial', f"[Spatial] Failed to apply positioning: {e_spatial}")
 
         # --- Play the audio ---
         # Strategy 1: Use pygame.mixer if available (best quality, no extra window)
@@ -554,6 +590,18 @@ def _safe_print(*args, **kwargs):
         except Exception:
             # Fallback to printing utf-8 replaced
             sys.stdout.buffer.write(out.encode('utf-8', 'replace') + b"\n")
+
+
+def _verbose_print(verbosity_flag: str, *args, **kwargs):
+    """Print only if the specified verbosity flag is enabled.
+    
+    Args:
+        verbosity_flag: 'spatial' or 'info' to check against corresponding flag
+    """
+    if verbosity_flag == 'spatial' and VERBOSE_SPATIAL:
+        _safe_print(*args, **kwargs)
+    elif verbosity_flag == 'info' and VERBOSE_INFO:
+        _safe_print(*args, **kwargs)
 
 
 def record_spoken_context(duration=4):
